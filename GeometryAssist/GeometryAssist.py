@@ -1,4 +1,4 @@
-"""Geometry Assist v0.14.14 for Autodesk Fusion.
+"""Geometry Assist v0.14.15 for Autodesk Fusion.
 
 Supported workflows:
 
@@ -279,7 +279,7 @@ class _FeatureRebuildDiagnostics:
         self.verbose = bool((settings or {}).get('verbose_rebuild_diagnostics', False))
         self.started = time.perf_counter()
         self.lines = []
-        self.add('Geometry Assist v0.14.14 Feature Rebuild diagnostic')
+        self.add('Geometry Assist v0.14.15 Feature Rebuild diagnostic')
         self.add('Timestamp: ' + datetime.datetime.now().astimezone().isoformat(timespec='seconds'))
         for line in _analysis_diagnostic_lines(analysis): self.add(line)
         if self.verbose:
@@ -11057,11 +11057,13 @@ def _rebuild_multiple_recognized_holes(analyses, settings):
         raise
 
 class _FeatureRebuildState:
-    def __init__(self, command, selection_input, info_input, hide_source_input):
+    def __init__(self, command, selection_input, info_input, hide_source_input, multi_mode_input):
         self.command = command
         self.selection_input = selection_input
         self.info_input = info_input
         self.hide_source_input = hide_source_input
+        self.multi_mode_input = multi_mode_input
+        self.activated_once = False
         self.settings = _load_settings()
         self.caches = []
         self.pending_seed_token = None
@@ -11275,7 +11277,62 @@ class _FeatureRebuildState:
             finally:
                 self.pruning_visible_selection = False
 
+    def _recognized_seed_items(self, faces, single=False):
+        """Read independent target seeds from actual Fusion selections.
+
+        In multi-mode the live SelectionCommandInput remains authoritative.
+        No clearing/re-adding occurs during inputChanged or validateInputs.
+        """
+        selected, occupied = [], set()
+        for face in faces:
+            try:
+                analysis, family, seed = self.analyze_face(face)
+                recognition = (analysis or {}).get('recognition_result') or {}
+                eligible = seed and (
+                    analysis.get('valid') or analysis.get('recognized_partial')
+                    or recognition.get('kind') in ('hole', 'partial_rotational_cut')
+                )
+                if not eligible:
+                    continue
+                membership = {_face_live_key(item) for item in (family or [face])}
+                membership.add(_face_live_key(face))
+                if membership.intersection(occupied):
+                    continue
+                occupied.update(membership)
+                selected.append((face, analysis))
+                if single:
+                    break
+            except Exception as exc:
+                _log('Feature Rebuild selection analysis failed: ' + str(exc))
+        return selected
+
+    def normalize_initial_selection(self):
+        """Normalize inherited selections once in activate, never commandCreated."""
+        if self.activated_once:
+            return
+        self.activated_once = True
+        faces = self._visible_faces()
+        selected = self._recognized_seed_items(
+            faces, single=not bool(self.multi_mode_input.value)
+        )
+        seeds = [face for face, _ in selected]
+        if len(faces) != len(seeds) or any(
+            not self._same_face(a, b) for a, b in zip(faces, seeds)
+        ):
+            self.pruning_visible_selection = True
+            try:
+                self.selection_input.clearSelection()
+                for face in seeds:
+                    if not self.selection_input.addSelection(face):
+                        raise RuntimeError('Fusion refused to restore an inherited seed selection.')
+            finally:
+                self.pruning_visible_selection = False
+        self.seed_faces = seeds
+        self.show_current_selection()
+
     def current_analyses(self):
+        if self.multi_mode_input.value:
+            return [analysis for _, analysis in self._recognized_seed_items(self._visible_faces())]
         analyses = []
         for face in self.seed_faces:
             try:
@@ -11291,9 +11348,17 @@ class _FeatureRebuildState:
             self.show_analysis({
                 'valid': False, 'reason': 'Select one or more cylindrical/conical faces belonging to recognized features.'
             })
+            self.info_input.text = 'Geometry Assist v0.14.15 — ' + (
+                'Multi-select active' if self.multi_mode_input.value else 'Legacy preview active'
+            ) + '\n' + self.info_input.text
             return
         if len(analyses) == 1:
             self.show_analysis(analyses[0])
+            self.info_input.text = (
+                'Geometry Assist v0.14.15 — '
+                + ('Multi-select active' if self.multi_mode_input.value else 'Legacy preview active')
+                + '\n1 selected rebuild target\n' + self.info_input.text
+            )
             return
         plan = _feature_rebuild_batch_plan(analyses)
         self.last_analysis = {
@@ -11302,6 +11367,7 @@ class _FeatureRebuildState:
         }
         if plan['valid']:
             self.info_input.text = '\n'.join([
+                'Geometry Assist v0.14.15 — Multi-select active',
                 f'{len(analyses)} rebuild targets on {len(plan["groups"])} source bodies — ready',
                 'Each source body gets ONE independent reconstruction with editable native features.',
                 'Separate holes on the same body are reconstructed sequentially and individually verified.',
@@ -11311,7 +11377,7 @@ class _FeatureRebuildState:
             UI.statusMessage = f'Feature Rebuild ready: {len(analyses)} targets.'
         else:
             self.info_input.text = (
-                f'{len(analyses)} rebuild targets — not ready\n' + plan['reason']
+                f'Geometry Assist v0.14.15 — {len(analyses)} targets not ready\n' + plan['reason']
             )
             UI.statusMessage = plan['reason']
 
@@ -11339,10 +11405,12 @@ class _FeatureRebuildSelectionHandler(adsk.core.SelectionEventHandler):
                 try: args.isSelectable = False
                 except Exception: pass
                 return
+            # Autodesk commits additionalEntities as actual selected faces.
+            # Never use it in additive multi-select mode.
+            if self.state.multi_mode_input.value:
+                return
             self.state.pending_seed_token = seed
             self.state.pending_face = face
-            # Whole-group preview is transient; it is never treated as an
-            # independent rebuild selection when Fusion commits the click.
             if family:
                 additional = adsk.core.ObjectCollection.create()
                 seed_token = None
@@ -11366,14 +11434,30 @@ class _FeatureRebuildInputChangedHandler(adsk.core.InputChangedEventHandler):
         super().__init__(); self.state = state
     def notify(self, args):
         try:
-            if not args.input or args.input.id != self.state.selection_input.id:
+            if not args.input or self.state.pruning_visible_selection:
                 return
-            if self.state.pruning_visible_selection:
+            if args.input.id == self.state.multi_mode_input.id:
+                if not self.state.multi_mode_input.value:
+                    self.state.reconcile_visible_selection()
+                self.state.show_current_selection()
                 return
-            self.state.reconcile_visible_selection()
+            if args.input.id != self.state.selection_input.id:
+                return
+            if not self.state.multi_mode_input.value:
+                self.state.reconcile_visible_selection()
             self.state.show_current_selection()
         except Exception:
             _log('Feature Rebuild inputChanged failed:\n' + traceback.format_exc())
+
+
+class _FeatureRebuildActivateHandler(adsk.core.CommandEventHandler):
+    def __init__(self, state):
+        super().__init__(); self.state = state
+    def notify(self, args):
+        try:
+            self.state.normalize_initial_selection()
+        except Exception:
+            _log('Feature Rebuild activate failed:\n' + traceback.format_exc())
 
 
 class _FeatureRebuildValidateHandler(adsk.core.ValidateInputsEventHandler):
@@ -11517,18 +11601,24 @@ class _FeatureRebuildCreatedHandler(adsk.core.CommandCreatedEventHandler):
                 'The inferred black preview is not itself another rebuild target.'
             )
             selection_input.addSelectionFilter('Faces')
-            selection_input.setSelectionLimits(1, 0)
+            selection_input.setSelectionLimits(1, 0)  # Autodesk: max 0 = unlimited.
+            selection_input.isUseCurrentSelections = True
+            multi_mode_input = inputs.addBoolValueInput(
+                'featureRebuildMultiMode', 'Multi-select targets (recommended)',
+                True, '', True
+            )
             info_input = inputs.addTextBoxCommandInput(
-                'featureRebuildInfo', 'Feature Rebuild',
-                'Select one or more recognized Hole / Bore features.',
-                5, True
+                'featureRebuildInfo', 'Feature Rebuild v0.14.15',
+                'Geometry Assist v0.14.15 — Multi-select active. Select independent cylindrical/conical faces.',
+                6, True
             )
             hide_source_input = inputs.addBoolValueInput(
                 'featureRebuildHideSource', 'Hide preserved source body after rebuild', True, '', True
             )
             inputs.addTextBoxCommandInput(
                 'featureRebuildNote', '',
-                'Multi-target experimental mode: select one cylindrical/conical face per target. '
+                'v0.14.15 experiment: Multi-select defaults ON and does not auto-select preview faces. '
+                'Turn it OFF for the previous whole-group black preview and single-target selection. '
                 'Distinct standalone holes on the same source body rebuild sequentially '
                 'into ONE independent component; selections on separate bodies rebuild '
                 'separately. Coordinated intersecting-cut groups can be rebuilt individually '
@@ -11537,32 +11627,24 @@ class _FeatureRebuildCreatedHandler(adsk.core.CommandCreatedEventHandler):
                 'an error discards all new reconstruction occurrences.',
                 5, True
             )
-            state = _FeatureRebuildState(command, selection_input, info_input, hide_source_input)
-            # Import ALL eligible seed selections rather than silently dropping
-            # everything after the first one. Group-preview faces are deduplicated.
-            for face in _selected_faces():
-                try:
-                    analysis, _, seed = state.analyze_face(face)
-                    recognition = analysis.get('recognition_result') or {}
-                    if seed and (analysis.get('valid') or analysis.get('recognized_partial') or
-                                 recognition.get('kind') in ('hole', 'partial_rotational_cut')):
-                        selection_input.addSelection(face)
-                except Exception:
-                    pass
-            state.reconcile_visible_selection()
-            state.show_current_selection()
-
+            state = _FeatureRebuildState(
+                command, selection_input, info_input, hide_source_input, multi_mode_input
+            )
+            # Fusion auto-imports current selections, then activate normalizes them.
+            # Calling addSelection during commandCreated violates Autodesk's API.
             sh = _FeatureRebuildSelectionHandler(state)
             ih = _FeatureRebuildInputChangedHandler(state)
+            ah = _FeatureRebuildActivateHandler(state)
             vh = _FeatureRebuildValidateHandler(state)
             eh = _FeatureRebuildExecuteHandler(state)
             dh = _FeatureRebuildDestroyHandler(state)
             command.selectionEvent.add(sh)
             command.inputChanged.add(ih)
+            command.activate.add(ah)
             command.validateInputs.add(vh)
             command.execute.add(eh)
             command.destroy.add(dh)
-            _handlers.extend([sh, ih, vh, eh, dh])
+            _handlers.extend([sh, ih, ah, vh, eh, dh])
         except Exception:
             UI.messageBox('Could not start Feature Rebuild:\n\n' + traceback.format_exc())
 
