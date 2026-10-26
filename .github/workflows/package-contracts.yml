@@ -1,0 +1,46 @@
+name: Offline package contracts
+
+on:
+  push:
+    branches:
+      - main
+      - "chore/**"
+    paths:
+      - "GeometryAssist/**"
+      - "tests/**"
+      - "docs/**"
+      - ".github/workflows/package-contracts.yml"
+      - ".gitignore"
+      - "README.md"
+  pull_request:
+    paths:
+      - "GeometryAssist/**"
+      - "tests/**"
+      - "docs/**"
+      - ".github/workflows/package-contracts.yml"
+      - ".gitignore"
+      - "README.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-contracts:
+    name: Static contracts / Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Configure Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Compile Fusion source
+        run: python -m py_compile GeometryAssist/GeometryAssist.py
+      - name: Validate manifest, resources and code contracts
+        run: python -m unittest discover -s tests -p "test_*.py" -v
