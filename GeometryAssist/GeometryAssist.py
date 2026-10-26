@@ -10897,6 +10897,165 @@ def _rebuild_recognized_hole(analysis, settings, hide_source=True):
         raise
 
 
+def _feature_rebuild_batch_plan(analyses):
+    """Preflight independent source bodies and disjoint native-hole batches.
+
+    Different bodies are always rebuilt independently. Several standalone holes
+    on the SAME body share one reconstructed copy and sequential native features.
+    A coordinated intersecting-cut group remains atomic and cannot yet be mixed
+    with other rebuild targets on that same source body.
+    """
+    if not analyses:
+        return {'valid': False, 'reason': 'Select at least one supported rebuild target.', 'groups': []}
+    groups = []
+    for index, analysis in enumerate(analyses, 1):
+        if not analysis or not analysis.get('valid'):
+            return {'valid': False, 'reason': (
+                f'Target {index}: ' + (analysis or {}).get('reason', 'Unsupported feature.')
+            ), 'groups': []}
+        source = _native_body(analysis.get('source_body'))
+        if not source:
+            return {'valid': False, 'reason': f'Target {index}: source body is no longer available.', 'groups': []}
+        try:
+            token = source.entityToken
+        except Exception:
+            token = None
+        bucket = None
+        for existing in groups:
+            if existing['source_body'] is source or (token and existing['body_token'] == token):
+                bucket = existing
+                break
+        if bucket is None:
+            bucket = {'source_body': source, 'body_token': token, 'analyses': [], 'mode': 'single'}
+            groups.append(bucket)
+        bucket['analyses'].append(analysis)
+
+    for group in groups:
+        members = group['analyses']
+        if len(members) <= 1:
+            continue
+        if any(a.get('rebuild_kind') == 'intersecting_cylindrical_group' for a in members):
+            return {'valid': False, 'reason': (
+                'The same source body contains both a coordinated intersecting-cut group '
+                'and another selected target. Mixed-group stock reconstruction on one '
+                'body is not yet validated; select that group separately.'
+            ), 'groups': []}
+        encountered = set()
+        for analysis in members:
+            tokens = set(analysis.get('feature_tokens') or ())
+            if not tokens or encountered.intersection(tokens):
+                return {'valid': False, 'reason': (
+                    'Selected holes on one source body have missing or overlapping '
+                    'recognized face membership; no batch reconstruction was started.'
+                ), 'groups': []}
+            encountered.update(tokens)
+        group['mode'] = 'sequential_native_holes'
+    return {'valid': True, 'reason': '', 'groups': groups, 'target_count': len(analyses)}
+
+
+def _rebuild_multiple_recognized_holes(analyses, settings):
+    """Create many editable native holes on ONE independent copied source body.
+
+    This path is used only for disjoint supported standalone holes. Never make
+    competing one-hole copies of the same body. Each hole must independently
+    restore the expected material and pass the existing geometry checks before
+    proceeding to the next feature. All intermediate features live inside one
+    reconstruction occurrence, which is discarded on any error.
+    """
+    if len(analyses) < 2:
+        raise RuntimeError('A multi-hole reconstruction requires at least two recognized holes.')
+    source_body = _native_body(analyses[0].get('source_body'))
+    if not source_body:
+        raise RuntimeError('The source body is no longer available.')
+    source_style = _capture_body_style(source_body)
+    source_props = _body_basic_properties(source_body)
+    occurrence = None
+    try:
+        _rebuild_diag_stage('BATCH-COPY', f'{len(analyses)} disjoint hole targets on one body')
+        component, occurrence, base_feature, body = _make_independent_rebuild_copy(source_body)
+        _apply_copied_body_style(source_style, body)
+        heal_features = []
+        hole_features = []
+        sketches = []
+        matches = []
+        for index, analysis in enumerate(analyses, 1):
+            _rebuild_diag_stage('BATCH-HOLE', f'{index}/{len(analyses)}: {analysis.get("title", "Hole")}')
+            mapped_faces, _ = _find_matching_region_faces(
+                body, analysis.get('feature_records', ()), settings
+            )
+            expected = len(analysis.get('feature_records', ()))
+            if expected <= 0 or len(mapped_faces) != expected:
+                raise RuntimeError(
+                    f'Batch hole {index}: mapped {len(mapped_faces)} of {expected} recognized faces.'
+                )
+            _rebuild_diag_stage('HEAL-COPY', f'Batch hole {index}: heal {len(mapped_faces)} faces')
+            try:
+                heal = component.features.deleteFaceFeatures.add(_object_collection(mapped_faces))
+            except Exception as exc:
+                raise RuntimeError(f'Batch hole {index}: Delete & Heal failed: {exc}')
+            if not heal:
+                raise RuntimeError(f'Batch hole {index}: Fusion returned no Delete & Heal feature.')
+            try:
+                heal.name = f'Geometry Assist - Heal Hole {index}'
+            except Exception:
+                pass
+            healed_body = _feature_body(heal, body)
+            if not healed_body:
+                raise RuntimeError(f'Batch hole {index}: could not resolve healed body.')
+            healed_volume = _body_basic_properties(healed_body).get('volume')
+            source_volume = source_props.get('volume')
+            if healed_volume is not None and source_volume is not None:
+                if healed_volume <= source_volume + max(abs(source_volume) * 1e-9, 1e-12):
+                    raise RuntimeError(
+                        f'Batch hole {index}: healing did not restore the expected solid volume.'
+                    )
+            if not _find_healed_support_face(
+                healed_body, analysis['support_record'], analysis['center_xyz'], settings
+            ):
+                raise RuntimeError(f'Batch hole {index}: missing restored support face.')
+            _rebuild_diag_stage('NATIVE-HOLE', f'Batch hole {index}: create and validate native HoleFeature')
+            feature, rebuilt_body, match, sketch, used_depth = _create_native_rebuilt_hole(
+                component, healed_body, analysis, source_body, settings
+            )
+            try:
+                feature.name = f'Geometry Assist - Rebuilt Hole {index} ({analysis.get("title", "Hole")})'
+            except Exception:
+                pass
+            heal_features.append(heal)
+            hole_features.append(feature)
+            sketches.append(sketch)
+            matches.append(match)
+            body = rebuilt_body
+            _rebuild_diag_note(
+                f'Batch hole {index}: volume_error={match.get("volume_error")}; '
+                f'feature_volume_error={match.get("feature_volume_error")}; '
+                f'area_error={match.get("area_error")}.'
+            )
+        _apply_copied_body_style(source_style, body)
+        try:
+            body.isVisible = True
+        except Exception:
+            pass
+        return {
+            'component': component,
+            'occurrence': occurrence,
+            'base_feature': base_feature,
+            'body': body,
+            'hole_features': hole_features,
+            'delete_features': heal_features,
+            'position_sketches': sketches,
+            'batch_count': len(analyses),
+            'volume_error': matches[-1].get('volume_error'),
+            'feature_volume_error': max(
+                [float(m['feature_volume_error']) for m in matches
+                 if m.get('feature_volume_error') is not None] or [0.0]
+            ),
+            'area_error': matches[-1].get('area_error'),
+        }
+    except Exception:
+        _discard_rebuild_occurrence(occurrence)
+        raise
+
 class _FeatureRebuildState:
     def __init__(self, command, selection_input, info_input, hide_source_input):
         self.command = command
@@ -10907,15 +11066,12 @@ class _FeatureRebuildState:
         self.caches = []
         self.pending_seed_token = None
         self.pending_face = None
-        self.committed_seed_token = None
-        self.committed_face = None
+        self.seed_faces = []
         self.last_analysis = None
         self.success_message = ''
-        # SelectionEvent.additionalEntities is used only to get the native-looking
-        # black inferred preview of the complete hole stack. Fusion also commits
-        # those additional faces on click, so Feature Rebuild immediately collapses
-        # the visible selection back to the single rotational seed face. This keeps
-        # the command single-feature/single-seed while preserving whole-stack hover.
+        # Fusion commits hover-preview additionalEntities as actual selections.
+        # Reconcile them back to MULTIPLE independent rotational seed faces, not
+        # to one seed and not to the planar preview faces.
         self.pruning_visible_selection = False
 
     def _cache_for(self, face):
@@ -10980,7 +11136,7 @@ class _FeatureRebuildState:
                         lines.append(f'Cut-center radius: {_format_length(analysis["center_radius"])}')
                     if analysis.get('angular_spacing_deg') is not None:
                         lines.append(f'Angular spacing: {_format_angle_deg(analysis["angular_spacing_deg"])}')
-                    lines.append('OK preserves the source body, analytically restores the recognized intersecting-cut volume on an independent reconstruction copy, then recreates the repeated intersecting cuts and the primary cut as ordinary native Fusion Hole features.')
+                    lines.append('OK preserves the source body, restores the coordinated cut volume on an independent copy, then recreates editable Cut Extrude or New Body + Combine/Cut features.')
                     lines.append('The chosen reconstruction order is not claimed to be the source model\'s original history.')
                     self.info_input.text = '\n'.join(lines)
                     UI.statusMessage = 'Feature Rebuild ready: coordinated intersecting cylindrical-cut group.'
@@ -11046,90 +11202,120 @@ class _FeatureRebuildState:
         except Exception:
             pass
 
-    def commit_pending(self):
-        if self.pending_seed_token and self.pending_face:
-            self.committed_seed_token = self.pending_seed_token
-            self.committed_face = self.pending_face
-        self.pending_seed_token = None
-        self.pending_face = None
-
     def _same_face(self, a, b):
         if not a or not b:
             return False
         try:
-            ta = a.entityToken
-            tb = b.entityToken
+            ta, tb = a.entityToken, b.entityToken
             if ta and tb:
                 return ta == tb
         except Exception:
             pass
         return a == b
 
-    def prune_visible_selection_to_seed(self):
-        """Keep only the authoritative cylindrical/conical seed after a click.
-
-        Whole-stack preview uses SelectionEventArgs.additionalEntities. Fusion
-        intentionally adds those entities to the SelectionCommandInput when the
-        click commits, including blind floors and annular shoulders. Those faces
-        are preview geometry, not independent Feature Rebuild inputs. Leaving them
-        selected caused later inputChanged events to overwrite the valid seed with
-        a planar face and made the dialog fall back to "Not rebuildable".
-        """
-        face = self.committed_face
-        if not face or self.pruning_visible_selection:
-            return
-        try:
-            if self.selection_input.selectionCount == 1:
-                only = adsk.fusion.BRepFace.cast(self.selection_input.selection(0).entity)
-                if self._same_face(only, face):
-                    return
-        except Exception:
-            pass
-
-        self.pruning_visible_selection = True
-        try:
-            self.selection_input.clearSelection()
-            self.selection_input.addSelection(face)
-        finally:
-            self.pruning_visible_selection = False
-
-    def find_seed_from_visible_selection(self):
+    def _visible_faces(self):
+        faces = []
         for i in range(self.selection_input.selectionCount):
             try:
                 face = adsk.fusion.BRepFace.cast(self.selection_input.selection(i).entity)
-                if not face:
-                    continue
-                analysis, _, seed = self.analyze_face(face)
-                # Prefer a recognized bore even when unsupported (e.g. blind), so
-                # the dialog can explain the actual limitation rather than using a
-                # random adjacent support face as the authority.
-                result = analysis.get('recognition_result') if analysis else None
-                if analysis.get('valid') or analysis.get('recognized_partial') or (result and result.get('kind') in ('hole', 'partial_rotational_cut')):
-                    self.committed_face = face
-                    self.committed_seed_token = seed
-                    self.show_analysis(analysis)
-                    return analysis
+                if face:
+                    faces.append(face)
             except Exception:
                 pass
-        self.committed_face = None
-        self.committed_seed_token = None
-        analysis = {'valid': False, 'reason': 'Select a cylindrical or conical face belonging to one Hole / Bore feature.'}
-        self.show_analysis(analysis)
-        return analysis
+        return faces
 
-    def current_analysis(self):
-        if self.selection_input.selectionCount <= 0:
-            return {'valid': False, 'reason': 'Select a cylindrical or conical face belonging to one Hole / Bore feature.'}
-        if self.committed_face:
+    def reconcile_visible_selection(self):
+        """Keep each distinct recognized seed; remove hover-only region faces.
+
+        The visible selection is also authoritative for Ctrl/deselect. Pending
+        selection events can add another seed, but cannot resurrect a removed one.
+        """
+        if self.pruning_visible_selection:
+            return
+        visible = self._visible_faces()
+        candidates = [face for face in self.seed_faces
+                      if any(self._same_face(face, item) for item in visible)]
+        if self.pending_face and any(self._same_face(self.pending_face, item) for item in visible):
+            candidates.append(self.pending_face)
+        if not candidates:
+            # Command launch may inherit a multi-face selection from Recognition.
+            candidates = visible
+        self.pending_face = None
+        self.pending_seed_token = None
+
+        seeds, claimed = [], set()
+        for face in candidates:
             try:
-                if not hasattr(self.committed_face, 'isValid') or self.committed_face.isValid:
-                    analysis, _, seed = self.analyze_face(self.committed_face)
-                    self.committed_seed_token = seed
-                    self.last_analysis = analysis
-                    return analysis
+                analysis, family, seed = self.analyze_face(face)
+                recognition = (analysis or {}).get('recognition_result') or {}
+                eligible = seed and (analysis.get('valid') or analysis.get('recognized_partial') or
+                                     recognition.get('kind') in ('hole', 'partial_rotational_cut'))
+                if not eligible:
+                    continue
+                keys = {_face_live_key(item) for item in (family or [face])}
+                keys.add(_face_live_key(face))
+                if claimed.intersection(keys):
+                    continue  # Another face of the SAME recognized feature/group.
+                claimed.update(keys)
+                seeds.append(face)
             except Exception:
-                pass
-        return self.find_seed_from_visible_selection()
+                _log('Feature Rebuild could not reconcile a selected seed:\n' + traceback.format_exc())
+
+        needs_prune = len(seeds) != len(visible) or any(
+            not self._same_face(a, b) for a, b in zip(seeds, visible)
+        )
+        self.seed_faces = seeds
+        if needs_prune:
+            self.pruning_visible_selection = True
+            try:
+                self.selection_input.clearSelection()
+                for face in seeds:
+                    if not self.selection_input.addSelection(face):
+                        raise RuntimeError('Fusion refused to restore a selected rebuild seed.')
+            finally:
+                self.pruning_visible_selection = False
+
+    def current_analyses(self):
+        analyses = []
+        for face in self.seed_faces:
+            try:
+                analysis, _, _ = self.analyze_face(face)
+                analyses.append(analysis)
+            except Exception as exc:
+                analyses.append({'valid': False, 'reason': str(exc)})
+        return analyses
+
+    def show_current_selection(self):
+        analyses = self.current_analyses()
+        if not analyses:
+            self.show_analysis({
+                'valid': False, 'reason': 'Select one or more cylindrical/conical faces belonging to recognized features.'
+            })
+            return
+        if len(analyses) == 1:
+            self.show_analysis(analyses[0])
+            return
+        plan = _feature_rebuild_batch_plan(analyses)
+        self.last_analysis = {
+            'valid': plan['valid'], 'title': 'Multiple Rebuild Targets',
+            'rebuild_kind': 'batch', 'reason': plan.get('reason', '')
+        }
+        if plan['valid']:
+            self.info_input.text = '\n'.join([
+                f'{len(analyses)} rebuild targets on {len(plan["groups"])} source bodies — ready',
+                'Each source body gets ONE independent reconstruction with editable native features.',
+                'Separate holes on the same body are reconstructed sequentially and individually verified.',
+                'Coordinated cut groups remain atomic. Original source bodies are preserved.',
+                'OK validates all targets before hiding any source bodies.',
+            ])
+            UI.statusMessage = f'Feature Rebuild ready: {len(analyses)} targets.'
+        else:
+            self.info_input.text = (
+                f'{len(analyses)} rebuild targets — not ready\n' + plan['reason']
+            )
+            UI.statusMessage = plan['reason']
+
+
 
 
 class _FeatureRebuildSelectionHandler(adsk.core.SelectionEventHandler):
@@ -11149,21 +11335,14 @@ class _FeatureRebuildSelectionHandler(adsk.core.SelectionEventHandler):
                 analysis.get('valid') or analysis.get('recognized_partial') or
                 (result and result.get('kind') in ('hole', 'partial_rotational_cut'))
             ))
-
-            # Only a rotational hole/bore member is allowed to become the
-            # authoritative committed seed. additionalEntities may contain planar
-            # shoulders/floors for whole-stack black preview; those must never
-            # replace the seed when Fusion reports their selection changes.
             if not is_hole_seed:
-                try:
-                    args.isSelectable = False
-                except Exception:
-                    pass
+                try: args.isSelectable = False
+                except Exception: pass
                 return
-
             self.state.pending_seed_token = seed
             self.state.pending_face = face
-            self.state.show_analysis(analysis)
+            # Whole-group preview is transient; it is never treated as an
+            # independent rebuild selection when Fusion commits the click.
             if family:
                 additional = adsk.core.ObjectCollection.create()
                 seed_token = None
@@ -11191,22 +11370,8 @@ class _FeatureRebuildInputChangedHandler(adsk.core.InputChangedEventHandler):
                 return
             if self.state.pruning_visible_selection:
                 return
-            if self.state.selection_input.selectionCount <= 0:
-                self.state.pending_seed_token = None
-                self.state.pending_face = None
-                self.state.committed_seed_token = None
-                self.state.committed_face = None
-                self.state.show_analysis({'valid': False, 'reason': 'Select a cylindrical or conical face belonging to one Hole / Bore feature.'})
-                return
-            if self.state.pending_seed_token:
-                self.state.commit_pending()
-            # additionalEntities provides the desired whole-stack hover preview but
-            # also commits those faces. Collapse the committed selection back to the
-            # one seed so one click always means one rebuild target.
-            if self.state.committed_face:
-                self.state.prune_visible_selection_to_seed()
-            analysis = self.state.current_analysis()
-            self.state.show_analysis(analysis)
+            self.state.reconcile_visible_selection()
+            self.state.show_current_selection()
         except Exception:
             _log('Feature Rebuild inputChanged failed:\n' + traceback.format_exc())
 
@@ -11216,8 +11381,9 @@ class _FeatureRebuildValidateHandler(adsk.core.ValidateInputsEventHandler):
         super().__init__(); self.state = state
     def notify(self, args):
         try:
-            analysis = self.state.current_analysis()
-            args.areInputsValid = bool(self.state.selection_input.selectionCount > 0 and analysis.get('valid'))
+            analyses = self.state.current_analyses()
+            plan = _feature_rebuild_batch_plan(analyses)
+            args.areInputsValid = bool(plan['valid'] and self.state.selection_input.selectionCount > 0)
         except Exception:
             args.areInputsValid = False
 
@@ -11228,42 +11394,87 @@ class _FeatureRebuildExecuteHandler(adsk.core.CommandEventHandler):
     def notify(self, args):
         global _ACTIVE_REBUILD_DIAGNOSTICS
         diagnostics = None
+        completed = []
+        saved_visibility = []
         try:
-            analysis = self.state.current_analysis()
-            diagnostics = _FeatureRebuildDiagnostics(self.state.settings, analysis)
+            analyses = self.state.current_analyses()
+            plan = _feature_rebuild_batch_plan(analyses)
+            diagnostic_analysis = analyses[0] if len(analyses) == 1 else {
+                'valid': plan['valid'], 'rebuild_kind': 'batch',
+                'title': f'{len(analyses)} Selected Rebuild Targets'
+            }
+            diagnostics = _FeatureRebuildDiagnostics(self.state.settings, diagnostic_analysis)
             _ACTIVE_REBUILD_DIAGNOSTICS = diagnostics
-            if not analysis.get('valid'):
-                raise RuntimeError(analysis.get('reason', 'Select one supported Hole / Bore feature.'))
-            if analysis.get('rebuild_kind') == 'intersecting_cylindrical_group':
-                result = _rebuild_intersecting_cylindrical_group(
-                    analysis,
-                    self.state.settings,
-                    bool(self.state.hide_source_input.value),
+            if not plan['valid']:
+                raise RuntimeError(plan['reason'])
+            for i, group in enumerate(plan['groups'], 1):
+                source = group['source_body']
+                try:
+                    visible = bool(source.isVisible)
+                except Exception:
+                    visible = None
+                saved_visibility.append((source, visible))
+                _rebuild_diag_stage(
+                    'BATCH-BODY', f'{i}/{len(plan["groups"])}: {len(group["analyses"])} targets'
                 )
+                if group['mode'] == 'sequential_native_holes':
+                    result = _rebuild_multiple_recognized_holes(group['analyses'], self.state.settings)
+                else:
+                    analysis = group['analyses'][0]
+                    if analysis.get('rebuild_kind') == 'intersecting_cylindrical_group':
+                        result = _rebuild_intersecting_cylindrical_group(
+                            analysis, self.state.settings, False
+                        )
+                    else:
+                        result = _rebuild_recognized_hole(
+                            analysis, self.state.settings, False
+                        )
+                completed.append(result)
+                _rebuild_diag_note(
+                    f'Completed source body {i}: reconstructed {len(group["analyses"])} targets; '
+                    f'volume_error={result.get("volume_error")}; '
+                    f'feature_volume_error={result.get("feature_volume_error")}.'
+                )
+
+            # Atomic visibility commit only after every reconstruction passes
+            # its existing per-feature and whole-body validation.
+            if bool(self.state.hide_source_input.value):
+                for source, _ in saved_visibility:
+                    source.isVisible = False
+            for result in completed:
+                try: result['body'].isVisible = True
+                except Exception: pass
+
+            count = plan['target_count']
+            if count == 1:
+                result = completed[0]
+                if result.get('rebuild_kind') == 'intersecting_cylindrical_group':
+                    self.state.success_message = (
+                        'Feature Rebuild complete: coordinated intersecting cut group '
+                        'recreated with editable native Fusion features.'
+                    )
+                else:
+                    self.state.success_message = (
+                        f'Feature Rebuild complete: native {result.get("title", "Hole / Bore")} '
+                        'created on an independent reconstruction copy.'
+                    )
             else:
-                result = _rebuild_recognized_hole(
-                    analysis,
-                    self.state.settings,
-                    bool(self.state.hide_source_input.value),
-                )
-            volume_error = result.get('volume_error')
-            check = '' if volume_error is None else f' Volume delta check: {volume_error*100.0:.4f}%.'
-            feature_volume_error = result.get('feature_volume_error')
-            local_check = '' if feature_volume_error is None else f' Local feature-volume delta: {feature_volume_error*100.0:.4f}%.'
-            if result.get('rebuild_kind') == 'intersecting_cylindrical_group':
                 self.state.success_message = (
-                    'Feature Rebuild complete: coordinated intersecting cylindrical-cut group recreated as native Fusion Hole features '
-                    f'(primary {_format_length(result["primary_diameter"])}, {int(result.get("child_count", 0))} × {_format_length(result["child_diameter"])}, Through All).' + check + local_check
-                )
-            else:
-                extent_label = 'Through All' if result.get('extent_kind') == 'through' else 'Blind'
-                self.state.success_message = (
-                    f'Feature Rebuild complete: native {result.get("title", "Hole / Bore")} created as a Fusion Hole feature ({extent_label}, main diameter {_format_length(result["diameter"])}).' + check + local_check
+                    f'Feature Rebuild complete: {count} selected targets across '
+                    f'{len(plan["groups"])} independent source bodies, with native editable features.'
                 )
             if diagnostics:
-                diagnostics.success(result)
+                diagnostics.success({'batch_count': count})
             UI.statusMessage = self.state.success_message
         except Exception as exc:
+            # All-or-nothing: incomplete attempts roll back internally, and all
+            # earlier successful reconstruction occurrences are discarded here.
+            for result in reversed(completed):
+                _discard_rebuild_occurrence(result.get('occurrence'))
+            for source, visible in saved_visibility:
+                if visible is not None:
+                    try: source.isVisible = visible
+                    except Exception: pass
             message = str(exc) or 'Feature Rebuild failed.'
             self.state.success_message = ''
             self.state.show_analysis({'valid': False, 'reason': message})
@@ -11301,14 +11512,15 @@ class _FeatureRebuildCreatedHandler(adsk.core.CommandCreatedEventHandler):
             command = args.command
             inputs = command.commandInputs
             selection_input = inputs.addSelectionInput(
-                'featureRebuildFaces', 'Hole / Bore',
-                'Hover/select a cylindrical/conical face in one supported hole or recognized intersecting cylindrical-cut group. Black preview shows the complete rebuild target.'
+                'featureRebuildFaces', 'Hole / Bore targets',
+                'Select one cylindrical/conical seed per desired independent feature. '
+                'The inferred black preview is not itself another rebuild target.'
             )
             selection_input.addSelectionFilter('Faces')
             selection_input.setSelectionLimits(1, 0)
             info_input = inputs.addTextBoxCommandInput(
                 'featureRebuildInfo', 'Feature Rebuild',
-                'Select a cylindrical or conical face belonging to one Hole / Bore feature.',
+                'Select one or more recognized Hole / Bore features.',
                 5, True
             )
             hide_source_input = inputs.addBoolValueInput(
@@ -11316,28 +11528,29 @@ class _FeatureRebuildCreatedHandler(adsk.core.CommandCreatedEventHandler):
             )
             inputs.addTextBoxCommandInput(
                 'featureRebuildNote', '',
-                'v0.13.2 keeps coordinated reconstruction for the validated clean intersecting-cut case, including groups opened to an exterior edge. The source body is preserved; Geometry Assist analytically restores the recognized Through All cylindrical cut volumes into a temporary reconstruction stock, persists that stock as the Base Feature, then recreates the repeated members and primary cut as ordinary native Fusion Hole features and verifies the final/local removed volume. This avoids relying on Delete & Heal where an open exterior cut has no unique fill boundary. The chosen reconstruction order is not asserted as original history. Complete simple, counterbore, and countersink holes remain supported as before. Feature Rebuild failures now emit structured diagnostics to Fusion Text Commands and Fusion\'s app log; verbose stage logging is available in Geometry Assist Settings.',
-                4, True
+                'Multi-target experimental mode: select one cylindrical/conical face per target. '
+                'Distinct standalone holes on the same source body rebuild sequentially '
+                'into ONE independent component; selections on separate bodies rebuild '
+                'separately. Coordinated intersecting-cut groups can be rebuilt individually '
+                'or on different source bodies, but are not yet mixed with other targets '
+                'on the same source body. Every native feature is geometry-validated; '
+                'an error discards all new reconstruction occurrences.',
+                5, True
             )
-
             state = _FeatureRebuildState(command, selection_input, info_input, hide_source_input)
-
-            # Reuse at most one authoritative rotational seed left by Feature
-            # Recognition. Recognition may leave the whole inferred hole region
-            # selected; importing all those faces here recreates the same ambiguity
-            # that v0.11.5 deliberately removes from committed rebuild selection.
+            # Import ALL eligible seed selections rather than silently dropping
+            # everything after the first one. Group-preview faces are deduplicated.
             for face in _selected_faces():
                 try:
                     analysis, _, seed = state.analyze_face(face)
-                    result = analysis.get('recognition_result') if analysis else None
-                    if seed and (analysis.get('valid') or (result and result.get('kind') == 'hole')):
-                        if selection_input.addSelection(face):
-                            state.committed_face = face
-                            state.committed_seed_token = seed
-                            state.show_analysis(analysis)
-                            break
+                    recognition = analysis.get('recognition_result') or {}
+                    if seed and (analysis.get('valid') or analysis.get('recognized_partial') or
+                                 recognition.get('kind') in ('hole', 'partial_rotational_cut')):
+                        selection_input.addSelection(face)
                 except Exception:
                     pass
+            state.reconcile_visible_selection()
+            state.show_current_selection()
 
             sh = _FeatureRebuildSelectionHandler(state)
             ih = _FeatureRebuildInputChangedHandler(state)
@@ -11352,7 +11565,6 @@ class _FeatureRebuildCreatedHandler(adsk.core.CommandCreatedEventHandler):
             _handlers.extend([sh, ih, vh, eh, dh])
         except Exception:
             UI.messageBox('Could not start Feature Rebuild:\n\n' + traceback.format_exc())
-
 
 # ---------------------------------------------------------------------------
 # Direct Edit — v0.8.3
