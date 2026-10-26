@@ -4,9 +4,9 @@
   "id": "e4f2bcef-4d3f-46e5-ae2a-2a69164c2a20",
   "author": "OpenAI / ChatGPT",
   "description": {
-    "": "Geometry Assist: inferred selection, history-independent Feature Recognition, partial/intersected cylindrical-cut relationship detection, native hole and coordinated cut Feature Rebuild, assisted fillet/chamfer tools, Direct Edit commands, and structured selectable/copyable diagnostics. Coordinated exterior-open cut reconstruction uses an inferred local planar pre-cut stock patch with persisted-body geometry validation; transient TemporaryBRep volume readings are no longer treated as authoritative."
+    "": "Geometry Assist: inferred selection, history-independent Feature Recognition, partial/intersected cylindrical-cut relationship detection, native hole and coordinated cut Feature Rebuild, assisted fillet/chamfer tools, Direct Edit commands, and structured selectable/copyable diagnostics. Coordinated exterior-open cut reconstruction uses an inferred local planar pre-cut stock patch with persisted-body geometry validation; transient TemporaryBRep volume readings are no longer treated as authoritative. v0.14.15 experimental build adds multi-target selection with an explicit compatibility mode; native Fusion validation pending."
   },
-  "version": "0.14.14",
+  "version": "0.14.15",
   "runOnStartup": true,
   "supportedOS": "windows|mac"
 }
