@@ -1,13 +1,13 @@
 # Multi-target Feature Rebuild — stage 1 (Fusion validation pending)
 
-**Branch:** \`feature/rebuild-multi-selection-stage1\`  
-**Parent production baseline:** \`main\`, v0.14.14.  
+**Branch:** `feature/rebuild-multi-selection-stage1`  
+**Parent production baseline:** `main`, v0.14.14.  
 **Status:** prototype; not approved for release or merge until real Autodesk Fusion regression tests pass.
 
 ## Why this change exists
 
 v0.14.14 intentionally committed **one rotational seed** despite accepting a
-selection input with an unbounded maximum. \`SelectionEvent.additionalEntities\`
+selection input with an unbounded maximum. `SelectionEvent.additionalEntities`
 made an entire recognized hole stack preview in black but Fusion committed those
 preview faces on click, so the handler pruned the visible selection down to
 **one face**. At execution, it rebuilt only the last seed.
@@ -15,13 +15,24 @@ preview faces on click, so the handler pruned the visible selection down to
 That protected single-feature correctness but prevented selection of multiple
 distinct holes or groups in one operation.
 
+## Reported failure and v0.14.15 correction (2026-10-26)
+
+The first multi-target test reported **only one valid selection** and still showed v0.14.14. This was not a successful Fusion validation. The prototype also had two confirmed API-design faults:
+
+- It called `SelectionCommandInput.addSelection()` inside `commandCreated`, where Autodesk documents that method as invalid. Preselected input normalization now happens on the first `command.activate` instead.
+- It combined inferred hover `additionalEntities` (which Fusion actually selects) with clearing/re-adding selections during `inputChanged`. Multi-select v0.14.15 now treats live Fusion input as authoritative, without selection rewriting or `additionalEntities` in that mode.
+
+The **Multi-select targets (recommended)** checkbox defaults ON. Turning it OFF restores the original single-target black inferred-group preview. The Feature Rebuild panel and manifest must clearly display **v0.14.15**; v0.14.14 means the user is still running an older package or the wrong add-in copy was launched.
+
+Offline CI passing does **not** prove the new Fusion selection behavior. Test two disjoint supported hole faces, confirm the dialog actually says `2 rebuild targets`, then verify subsequent native features and final geometry. Keep v0.14.14 backed up and the PR in draft until this passes.
+
 ## Current candidate behavior
 
-1. Each clicked recognized feature contributes **one actual cylindrical/conical seed**. Related hover-preview faces are deduplicated; selecting a second face of the same feature does not count the feature twice.
-2. \`Ctrl\`-deselection should remove only that seed (Fusion interaction to verify).
+1. In default multi-select mode, each clicked recognized cylindrical/conical face contributes to the live selection without injected preview faces. Two selected faces from the same recognized hole still count as one target. The legacy single-target mode retains black whole-feature hover preview.
+2. `Ctrl`-deselection should remove only that seed (Fusion interaction to verify).
 3. The selected faces are reanalyzed against the final B-Rep before execution. Unsupported or invalid targets block the entire operation.
 4. Targets are grouped by native source-body identity.
-5. **Two or more disjoint supported standalone holes on the same body:** copy the original once; heal and reconstruct each hole in sequence, producing native \`HoleFeature\` entries on the **same new result body**. Each intermediate result must pass the existing whole-body and local hole-volume validation.
+5. **Two or more disjoint supported standalone holes on the same body:** copy the original once; heal and reconstruct each hole in sequence, producing native `HoleFeature` entries on the **same new result body**. Each intermediate result must pass the existing whole-body and local hole-volume validation.
 6. **Different original bodies:** build one independent reconstruction result per source body.
 7. **Single coordinated intersecting cylindrical group:** use the previously validated v0.14.14 geometry engine unchanged.
 8. **Coordinated group plus any other selected target on the same body:** preflight refusal; the merged restoration/cut sequencing is not yet proven.
@@ -55,7 +66,7 @@ For every PASS, verify **actual editable native features**, body geometry/volume
 
 ## Known risks to investigate
 
-- Fusion may fire \`inputChanged\` in unexpected order while adding preview faces or re-adding normalized seed faces. Record selection/hover/deselection on video.
+- Fusion may fire `inputChanged` in unexpected order while adding preview faces or re-adding normalized seed faces. Record selection/hover/deselection on video.
 - After one native hole is built, the topology of nearby faces may have changed. The next hole's original frozen face records are matched geometrically to the latest result body; check disjoint and close/tangent holes.
 - Inter-feature dependencies and overlapping cut volumes are intentionally excluded from this stage.
 - Full geometric equivalence cannot be proven by whole-body volume alone. Existing local removed-volume checks are retained, but broader face/surface comparisons would improve confidence.
@@ -63,7 +74,7 @@ For every PASS, verify **actual editable native features**, body geometry/volume
 
 ## Test boundary
 
-\`tests/test_rebuild_batch_plan.py\` executes the production planner's AST using
+`tests/test_rebuild_batch_plan.py` executes the production planner's AST using
 dummy bodies and verifies preflight grouping/refusal behavior without importing
 Fusion. Existing offline contract checks continue to cover basic package integrity.
 **These tests do not execute Fusion geometry or selection events.**
