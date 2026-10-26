@@ -1,6 +1,14 @@
-# Geometry Assist v0.14.14 for Autodesk Fusion
+# Geometry Assist v0.14.15 for Autodesk Fusion
 
 Geometry Assist adds inferred geometry selection and assisted modeling workflows while keeping normal Fusion B-Rep bodies and timeline features as the modeling authority.
+
+## Experimental in v0.14.15 — multi-selection lifecycle correction (Fusion test required)
+
+This is a distinct experimental package, not the validated v0.14.14 release. In **Feature Rebuild**, the version should be visible in the panel heading and status. **Multi-select targets (recommended)** defaults ON and uses only the faces actually clicked or inherited by Fusion; selecting one feature will not automatically commit the entire recognized preview group. Several recognized standalone holes on one source body are planned as sequential, native features on one reconstructed body. Turn Multi-select OFF to use the legacy single-feature mode with its black inferred-group preview.
+
+The prior v0.14.14-labeled multi-selection prototype incorrectly attempted `SelectionCommandInput.addSelection` in the `commandCreated` event (Autodesk only permits this after activation). It also repeatedly cleared and re-added the selection while Fusion dispatched `inputChanged`. v0.14.15 instead initializes preselected faces in `command.activate`, preserves live user selections in multi mode, and disables committing `SelectionEvent.additionalEntities` preview faces in multi mode.
+
+**Fusion validation remains pending.** Do not replace the proven v0.14.14 reference install without a backup; test the number of selected rebuild targets displayed in the command before any geometry-changing action.
 
 ## Commands
 
