@@ -1,0 +1,12 @@
+{
+  "autodeskProduct": "Fusion360",
+  "type": "addin",
+  "id": "e4f2bcef-4d3f-46e5-ae2a-2a69164c2a20",
+  "author": "OpenAI / ChatGPT",
+  "description": {
+    "": "Geometry Assist: inferred selection, history-independent Feature Recognition, partial/intersected cylindrical-cut relationship detection, native hole and coordinated cut Feature Rebuild, assisted fillet/chamfer tools, Direct Edit commands, and structured selectable/copyable diagnostics. Coordinated exterior-open cut reconstruction uses an inferred local planar pre-cut stock patch with persisted-body geometry validation; transient TemporaryBRep volume readings are no longer treated as authoritative."
+  },
+  "version": "0.14.14",
+  "runOnStartup": true,
+  "supportedOS": "windows|mac"
+}
