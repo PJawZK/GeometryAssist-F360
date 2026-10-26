@@ -11266,6 +11266,13 @@ class _FeatureRebuildState:
         needs_prune = len(seeds) != len(visible) or any(
             not self._same_face(a, b) for a, b in zip(seeds, visible)
         )
+        # This reducer is ONLY for the opt-in legacy preview mode.
+        # In that mode, never normalize to more than one committed seed.
+        if not self.multi_mode_input.value:
+            seeds = seeds[:1]
+            needs_prune = len(seeds) != len(visible) or any(
+                not self._same_face(x, y) for x, y in zip(seeds, visible)
+            )
         self.seed_faces = seeds
         if needs_prune:
             self.pruning_visible_selection = True
